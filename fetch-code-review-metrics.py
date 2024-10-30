@@ -7,9 +7,10 @@ import requests
 import csv
 
 BASE_QUERY = """query {{
-  search(query: \"{}\", type: ISSUE, last: 100) {{
+  search(query: \"{}\", type: ISSUE, first: 50 {}) {{
     issueCount
     edges {{
+      cursor
       node {{
         ... on PullRequest {{
         number
@@ -20,7 +21,7 @@ BASE_QUERY = """query {{
         comments {{
           totalCount
         }}
-        reviews(first: 1) {{
+        reviews(first: 2) {{
           edges {{
             node {{
               ... on PullRequestReview {{
@@ -48,17 +49,24 @@ BASE_QUERY = """query {{
 }}
 """
  
-def fetch_code_review_metrics(query, queryOpts, token):
+def fetch_code_review_metrics(query, queryOpts, token, cursor=""):
     if query is None:
         queryString = "is:merged is:pr"
 
         if queryOpts["repo"] is not None:
             queryString = "{} repo:{}".format(queryString, queryOpts["repo"])
 
+        if queryOpts["start"] is not None:
+            queryString = "{} created:>{}".format(queryString, queryOpts["start"])
+
         if queryOpts["org"] is not None:
             queryString = "{} org:{}".format(queryString, queryOpts["org"])
+        queryString = "{} sort:created-desc".format(queryString)
 
-        query = BASE_QUERY.format(queryString)
+        if cursor != "":
+            cursor = ", after:\"{}\"".format(cursor)
+
+        query = BASE_QUERY.format(queryString, cursor)
 
     url = 'https://api.github.com/graphql'
     auth = 'Bearer {}'.format(token)
@@ -69,16 +77,20 @@ def fetch_code_review_metrics(query, queryOpts, token):
     return response
 
 def parse_into_dicts(body):
+    if 'errors' in body and len(body["errors"]) > 0:
+        raise Exception(body["errors"][0]["message"])
     prs = body["data"]["search"]["edges"]
-    return map(parse_pr_into_dict, prs)
+    return list(map(parse_pr_into_dict, prs))
 
 def parse_pr_into_dict(pr):
     node = pr["node"]
+    cursor = pr["cursor"]
     created_at = node["createdAt"]
     merged_at = node["mergedAt"]
     cycle_time = time_difference_in_minutes(created_at, merged_at)
     lines_changed = node["additions"] + node["deletions"]
     pr_dict = {
+        'cursor': cursor,
         'title': node["title"],
         'number': node["number"],
         'created_by': node["createdBy"]["login"],
@@ -89,6 +101,9 @@ def parse_pr_into_dict(pr):
         'first_reviewed_at': '-',
         'first_reviewed_by': '-',
         'lead_time_minutes': 0,
+        'second_reviewed_at': '-',
+        'second_reviewed_by': '-',
+        'second_lead_time_minutes': 0,
         'lines_changed': lines_changed,
         'comments_added': node["comments"]["totalCount"]
     }
@@ -102,6 +117,14 @@ def parse_pr_into_dict(pr):
         pr_dict['first_reviewed_by'] = first_review['reviewedBy']['login']
         pr_dict['lead_time_minutes'] = lead_time
 
+    if len(reviews) > 1:
+        second_review = reviews[1]['node']
+        second_reviewed_at = second_review['reviewedAt']
+        second_review_lead_time = time_difference_in_minutes(created_at, second_reviewed_at)
+        pr_dict['second_reviewed_at'] = second_reviewed_at
+        pr_dict['second_reviewed_by'] = second_review['reviewedBy']['login']
+        pr_dict['second_lead_time_minutes'] = second_review_lead_time
+
     return pr_dict
 
 
@@ -110,12 +133,15 @@ def time_difference_in_minutes(start_ts, end_ts):
     start = parse(start_ts)
     return (end - start).total_seconds() / 60
 
-def print_as_csv(prs):
-    with open('code_review_metrics.csv', 'w', newline='') as csvfile:
+def print_as_csv(file, prs):
+    with open(file, 'w', newline='') as csvfile:
 
         field_names = [ 
-            'title', 'number', 'url', 'created_by', 'created_at', 'first_reviewed_at', 'first_reviewed_by', 'merged_at',
-            'cycle_time_minutes', 'lead_time_minutes', 'lines_changed', 'comments_added'
+            'cursor', 'title', 'number', 'url', 'created_by', 'created_at',
+            'first_reviewed_at', 'first_reviewed_by',
+            'second_reviewed_at','second_reviewed_by',
+            'merged_at',
+            'cycle_time_minutes', 'lead_time_minutes', 'second_lead_time_minutes', 'lines_changed', 'comments_added'
         ]
 
         writer = csv.DictWriter(csvfile, fieldnames=field_names)
@@ -125,6 +151,23 @@ def print_as_csv(prs):
             writer.writerow(pr)
 
 
+def fetch_prs(query, queryOpts, token, cursor=""):
+    response = fetch_code_review_metrics(query, queryOpts, token, cursor)
+    if response.status_code != 200:
+        print('Error pulling code review data. Status: {}, err: {}'.format(response.status_code, response.json()))
+        return []
+    return parse_into_dicts(response.json())
+
+def fetch_all_prs(query, queryOpts, token):
+    prs = fetch_prs(query, queryOpts, token)
+    new_prs = prs
+    while len(new_prs) > 0:
+        print("requesting next batch from cursor: {}".format(prs[-1]['cursor']))
+        new_prs = fetch_prs(query, queryOpts, token, prs[-1]['cursor'])
+        prs.extend(new_prs)
+
+    return prs
+
 def main():
     # Initialize parser
     parser = argparse.ArgumentParser()
@@ -132,6 +175,7 @@ def main():
     parser.add_argument("-o", "--org", help = "The orginization to grab pull request metrics from")
     parser.add_argument("-r", "--repo", help = "The repository to grab pull request metrics from")
     parser.add_argument("-q", "--query", help="The query to search for pull requests. See more at <> . This overrides whatever was set via '-r' or '--repo'")
+    parser.add_argument("-s", "--start", help="start from given date YYYY-MM-DD")
     parser.add_argument("-t", "--token", help = "A GitHub token to access the GitHub API")
     parser.add_argument("-f", "--file", help = "The path to the csv file to generate")
 
@@ -140,16 +184,11 @@ def main():
 
     queryOpts = {
         "repo": args.repo,
-        "org": args.org
+        "org": args.org,
+        "start": args.start,
     }
 
-    response = fetch_code_review_metrics(args.query, queryOpts, args.token)
-    if response.status_code == 200:
-        prs = parse_into_dicts(response.json())
-        print_as_csv(prs)
-    else:
-        print('Error pulling code review data. Status: {}, err: {}'.format(response.status_code, response.json()))
-        exit(1)
+    print_as_csv(args.file, fetch_all_prs(args.query, queryOpts, args.token))
 
 if __name__ == "__main__":
     main()
